@@ -1,0 +1,18 @@
+#!/bin/sh
+# запускается waypipe-сервером, поэтому WAYLAND_DISPLAY уже выставлен им
+export GDK_BACKEND=wayland
+# HOME на постоянном томе: reset-system обязан сохранить закладки и сессию, стирает их только reset-all
+if [ -d /data ]; then
+  HOME=/data/home
+else
+  HOME=/root
+fi
+export HOME
+mkdir -p "$HOME"
+
+browser=epiphany
+command -v "$browser" >/dev/null 2>&1 || browser=epiphany-browser
+
+# без exec: закрытое окно должно быть видно в консоли, а не выглядеть как молчание
+dbus-run-session -- "$browser"
+echo "MIYORI: $browser завершился с кодом $?, аптайм $(cat /proc/uptime)"

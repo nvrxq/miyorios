@@ -1,0 +1,52 @@
+# Резолвер сетевой машины. Слушает хост и спейсы, наверх ходит только по DoH. В cgroup
+# "tunnel" он намеренно не запускается: та cgroup — исключение из output-политики, и с ней
+# запрос мог бы уйти на карту мимо туннеля. Без неё выход один — @tunnels, иначе отказ.
+#
+# Секции [sources] здесь намеренно НЕТ. Штатный конфиг Debian качает список резолверов при
+# каждом старте и требует для этого bootstrap-DNS: лишняя точка отказа ровно на том пути,
+# без которого хост остаётся без имён. Stamps ниже взяты дословно из официального
+# подписанного public-resolvers.md (download.dnscrypt.info, v2, забран 2026-09-02) и несут
+# в себе IP-адрес — значит резолвить имя сервера не нужно вовсе.
+
+listen_addresses = ['10.60.0.1:53', '10.59.0.1:53']
+max_clients = 250
+
+server_names = ['cloudflare', 'quad9']
+
+ipv4_servers = true
+ipv6_servers = false
+dnscrypt_servers = false
+doh_servers = true
+
+require_dnssec = false
+require_nolog = true
+require_nofilter = true
+
+force_tcp = false
+timeout = 5000
+keepalive = 30
+
+# системный резолвер гостя не спрашиваем ни при каких обстоятельствах: в miyori-net его
+# заполняет dhclient адресом провайдера, и один такой запрос — уже утечка имени
+ignore_system_dns = true
+
+# проба сети выключена: туннель поднимается позже старта, и ожидание тут превратилось бы
+# в задержку загрузки. Промахи запросов dnscrypt-proxy переживает и повторяет сам
+netprobe_timeout = 0
+
+# AAAA не отдаём никогда. IPv6 на хосте погашен, у br-host адреса v6 нет — ответ с AAAA
+# заставил бы браузер ждать таймаута на каждом имени вместо мгновенного ухода на IPv4
+block_ipv6 = true
+
+cache = true
+cache_size = 4096
+cache_min_ttl = 2400
+cache_max_ttl = 86400
+
+[static]
+
+  [static.'cloudflare']
+  stamp = 'sdns://AgcAAAAAAAAABzEuMC4wLjEAEmRucy5jbG91ZGZsYXJlLmNvbQovZG5zLXF1ZXJ5'
+
+  [static.'quad9']
+  stamp = 'sdns://AgMAAAAAAAAABzkuOS45LjkgsBkgdEu7dsmrBT4B4Ht-BQ5HPSD3n3vqQ1-v5DydJC8SZG5zOS5xdWFkOS5uZXQ6NDQzCi9kbnMtcXVlcnk'

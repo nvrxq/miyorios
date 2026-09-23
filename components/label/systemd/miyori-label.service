@@ -1,0 +1,11 @@
+[Unit]
+Description=miyori-label — полоса trust label поверх окна
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/miyori-label
+
+[Install]
+WantedBy=graphical-session.target

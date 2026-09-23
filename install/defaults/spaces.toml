@@ -1,0 +1,18 @@
+# CID назначает хост при запуске VM; гость его подделать не может
+[[space]]
+id = "spike"
+cid = 3
+label = "untrusted"
+color = "#e03131"
+
+[[space]]
+id = "spike2"
+cid = 4
+label = "untrusted"
+color = "#1971c2"
+
+[[space]]
+id = "miyori-net"
+cid = 9
+label = "trusted"
+color = "#2f9e44"

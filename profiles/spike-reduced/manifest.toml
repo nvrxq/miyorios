@@ -1,0 +1,36 @@
+id = "spike-reduced"
+description = "Тот же спейс, но уровнем reduced: проверяет, что уровень виден в списке, деталях и полосе"
+
+[base]
+builder = "mmdebstrap"
+suite   = "noble"
+sources = [
+  "deb http://archive.ubuntu.com/ubuntu noble main universe",
+  "deb http://archive.ubuntu.com/ubuntu noble-updates main universe",
+  "deb http://security.ubuntu.com/ubuntu noble-security main universe",
+]
+# исходно guest/packages.list; e2fsprogs — mkfs.ext4/dumpe2fs для тома данных (задача 8)
+packages = [
+  "systemd-sysv", "iproute2", "linux-image-virtual", "initramfs-tools",
+  "libwayland-client0", "weston", "wayland-utils", "python3-minimal", "e2fsprogs",
+]
+
+[app]
+mode    = "app"
+command = "/usr/local/bin/miyori-app"
+
+[resources]
+memory_mb = 512
+cpus      = 1
+disk_gb   = 2
+data_mb   = 64
+
+# gpu = none намеренно: V-REDUCED-VISIBLE про видимость уровня, а не про загрузку с GPU,
+# и пакетный QEMU этой машины virtio-gpu-gl не умеет вовсе (документации проекта)
+[isolation]
+level  = "reduced"
+gpu    = "none"
+reason = "профиль стенда: уровень заявлен, чтобы его видимость можно было проверить на живом спейсе"
+
+[network]
+via = "miyori-net"

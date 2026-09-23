@@ -1,0 +1,22 @@
+[Unit]
+Description=miyori — хостовый киллсвитч: IPv6 наружу закрыт, DNS только через miyori-net
+Documentation=file://@@MIYORI_REPO@@/документации проекта
+# правила обязаны встать раньше, чем на линке появится адрес: промежуток между поднятием
+# интерфейса и загрузкой таблицы — это промежуток, в котором утечка успевает произойти
+DefaultDependencies=no
+After=nftables.service systemd-sysctl.service local-fs.target
+# DefaultDependencies=no снимает и ожидание /usr, а скрипту нужны nft, sysctl и dig оттуда
+RequiresMountsFor=/usr
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# бинарь, а не путь в репозиторий: /home на этой стадии загрузки может быть ещё не смонтирован
+# режим берём из файла: пересборка таблицы без него сняла бы строгий режим
+ExecStart=/bin/sh -c '/usr/local/sbin/miyori-host-killswitch on $(cat /etc/miyorios/killswitch.mode 2>/dev/null)'
+ExecStop=/usr/local/sbin/miyori-host-killswitch off
+
+[Install]
+WantedBy=multi-user.target

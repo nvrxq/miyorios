@@ -1,0 +1,3 @@
+WAYPIPE_REPO=https://gitlab.freedesktop.org/mstoeckl/waypipe.git
+WAYPIPE_TAG=v0.11.1
+WAYPIPE_COMMIT=dcedd03779982d5b5524b48d7a16602c0f497d76

@@ -1,0 +1,16 @@
+[Unit]
+Description=Аплинк MiyoriOS: карта хоста отдана в VFIO
+Before=miyori-net.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@@MIYORI_REPO@@
+EnvironmentFile=/etc/miyorios/miyori-net.env
+ExecStart=/usr/bin/bash components/net/vfio-bind.sh ${MIYORI_UPLINK_PCI}
+ExecStop=/usr/bin/bash components/net/vfio-unbind.sh ${MIYORI_UPLINK_PCI}
+# вернуть карту драйверу мало: NetworkManager отпустил интерфейс, когда тот исчез
+ExecStop=-/usr/bin/nmcli device set ${MIYORI_UPLINK_IFC} managed yes
+
+[Install]
+WantedBy=multi-user.target

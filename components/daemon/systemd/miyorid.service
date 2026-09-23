@@ -1,0 +1,21 @@
+[Unit]
+Description=miyorid — демон MiyoriOS: хранилище спейсов и control.sock
+
+[Service]
+Type=simple
+# группа сокета — впечатывается install-system.sh: имя оператора нельзя закоммитить заранее
+ExecStart=/usr/local/sbin/miyorid --group @@MIYORI_GROUP@@
+# без Restart=always: упавший демон обязан быть заметен, а не тихо перезапускаться на месте
+
+# build зовёт tools/build-profile.sh относительным путём: без этого кнопка «Собрать образ»
+# отвечает "No such file or directory", потому что systemd стартует службу из корня
+WorkingDirectory=@@MIYORI_REPO@@
+# сборщик внутри дёргает cargo, а тот берёт блокировку в target/ — под ProtectHome он бы её не взял
+ReadWritePaths=@@MIYORI_REPO@@
+
+# read-only, а не yes: профили в /var/lib/miyorios/profiles — симлинки в дерево оператора
+# (ручной стенд), и при yes демон увидел бы вместо них пустой /home; писать в /home ему незачем
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

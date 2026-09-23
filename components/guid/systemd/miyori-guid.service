@@ -1,0 +1,11 @@
+[Unit]
+Description=miyori-guid — брокер vsock для окон спейсов
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/miyori-guid --registry /etc/miyorios/spaces.toml --port 1700
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""Гостевая сторона VERIFY M2: достижимость шлюза/соседа и попытки спуфинга."""
+import os
+import socket
+import struct
+import sys
+import time
+
+GW_IP = "10.59.0.1"
+BCAST_IP = "10.59.0.255"
+MIYORI_NET_MAC = "52:54:00:6d:59:01"
+PROBE_PORT = 9  # discard-порт: ничего не слушает, важен сам факт ответа или тишины
+# утечку опознаём по содержимому: подделанный MAC источника по определению совпадает с чужим
+LEAK_MARKER = b"miyori-netprobe-"
+LISTEN_SECONDS = 40
+PROBER_DELAY = 15
+FLOOD_DEST_V4 = "1.1.1.1"
+FLOOD_DEST_V6 = "2606:4700:4700::1111"
+
+
+def checksum16(data):
+    if len(data) % 2:
+        data += b"\x00"
+    s = sum((data[i] << 8) + data[i + 1] for i in range(0, len(data), 2))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += s >> 16
+    return ~s & 0xFFFF
+
+
+def mac_bytes(mac_str):
+    return bytes.fromhex(mac_str.replace(":", ""))
+
+
+
+def icmp_ping(dest_ip, timeout=2.0):
+    ident = os.getpid() & 0xFFFF
+    payload = LEAK_MARKER + b"ping"
+    head = struct.pack("!BBHHH", 8, 0, 0, ident, 1)
+    chksum = checksum16(head + payload)
+    packet = struct.pack("!BBHHH", 8, 0, chksum, ident, 1) + payload
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    except OSError:
+        return False
+    s.settimeout(timeout)
+    ok = False
+    try:
+        s.sendto(packet, (dest_ip, 0))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                data, addr = s.recvfrom(1024)
+            except socket.timeout:
+                break
+            if addr[0] != dest_ip:
+                continue
+            ip_hlen = (data[0] & 0x0F) * 4
+            icmp = data[ip_hlen:]
+            if len(icmp) < 8:
+                continue
+            itype, _, _, rident, _ = struct.unpack("!BBHHH", icmp[:8])
+            if itype == 0 and rident == ident:
+                ok = True
+                break
+    except OSError:
+        ok = False
+    finally:
+        s.close()
+    return ok
+
+
+def arp_query(nic, self_mac, self_ip, dest_ip, timeout=2.0):
+    eth_p_arp = 0x0806
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(eth_p_arp))
+    s.bind((nic, 0))  # протокол уже задан в socket(): 0 в bind — как в listener(), а не сырое число
+    s.settimeout(timeout)
+    bcast = b"\xff" * 6
+    arp = struct.pack(
+        "!HHBBH6s4s6s4s",
+        1, 0x0800, 6, 4, 1,
+        self_mac, socket.inet_aton(self_ip),
+        b"\x00" * 6, socket.inet_aton(dest_ip),
+    )
+    frame = bcast + self_mac + struct.pack("!H", eth_p_arp) + arp
+    found = None
+    try:
+        s.send(frame)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                data = s.recv(65535)
+            except socket.timeout:
+                break
+            if len(data) < 42 or struct.unpack("!H", data[12:14])[0] != eth_p_arp:
+                continue
+            op = struct.unpack("!H", data[20:22])[0]
+            spa = socket.inet_ntoa(data[28:32])
+            if op == 2 and spa == dest_ip:
+                found = ":".join(f"{b:02x}" for b in data[22:28])
+                break
+    except OSError:
+        found = None
+    finally:
+        s.close()
+    return found
+
+
+def tcp_probe(dest_ip, port=PROBE_PORT, timeout=2.0):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((dest_ip, port))
+        return True
+    except ConnectionRefusedError:
+        return True  # RST дошёл — значит пакет реально доехал до соседа
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def udp_send(dest_ip, port=PROBE_PORT, broadcast=False):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if broadcast:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    try:
+        s.sendto(LEAK_MARKER + b"udp", (dest_ip, port))
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
+def spoof_mac_frame(nic, fake_src_mac):
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+    s.bind((nic, 0))
+    try:
+        frame = b"\xff" * 6 + fake_src_mac + struct.pack("!H", 0x0800) + LEAK_MARKER + b"spoof-mac"
+        s.send(frame)
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
+def spoof_ip_packet(fake_src_ip, dest_ip):
+    ident = os.getpid() & 0xFFFF
+    payload = LEAK_MARKER + b"spoof-ip"
+    icmp_head = struct.pack("!BBHHH", 8, 0, 0, ident, 1)
+    icmp_chk = checksum16(icmp_head + payload)
+    icmp_pkt = struct.pack("!BBHHH", 8, 0, icmp_chk, ident, 1) + payload
+
+    total_len = 20 + len(icmp_pkt)
+    ip_head = struct.pack(
+        "!BBHHHBBH4s4s", 0x45, 0, total_len, 0, 0, 64, socket.IPPROTO_ICMP, 0,
+        socket.inet_aton(fake_src_ip), socket.inet_aton(dest_ip),
+    )
+    ip_chk = checksum16(ip_head)
+    ip_head = struct.pack(
+        "!BBHHHBBH4s4s", 0x45, 0, total_len, 0, 0, 64, socket.IPPROTO_ICMP, ip_chk,
+        socket.inet_aton(fake_src_ip), socket.inet_aton(dest_ip),
+    )
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    try:
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        s.sendto(ip_head + icmp_pkt, (dest_ip, 0))
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
+def flood_icmp(dest_ip=FLOOD_DEST_V4):
+    ident = os.getpid() & 0xFFFF
+    payload = LEAK_MARKER + b"flood-icmp"
+    head = struct.pack("!BBHHH", 8, 0, 0, ident, 1)
+    chksum = checksum16(head + payload)
+    packet = struct.pack("!BBHHH", 8, 0, chksum, ident, 1) + payload
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    except OSError:
+        return False
+    try:
+        s.sendto(packet, (dest_ip, 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def flood_udp_dns(dest_ip=FLOOD_DEST_V4):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.sendto(LEAK_MARKER + b"flood-dns", (dest_ip, 53))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def flood_tcp_https(dest_ip=FLOOD_DEST_V4, port=443):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setblocking(False)
+    try:
+        s.connect((dest_ip, port))
+    except BlockingIOError:
+        pass  # неблокирующий connect: SYN уже поставлен в очередь, ответа ждать незачем
+    except OSError:
+        return False
+    finally:
+        s.close()
+    return True
+
+
+def flood_ipv6(dest_ip=FLOOD_DEST_V6):
+    # guest/init.sh глушит IPv6 на самом госте (disable_ipv6=1) — попытка может не покинуть гостя вовсе
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    except OSError:
+        return False
+    try:
+        s.sendto(LEAK_MARKER + b"flood-v6", (dest_ip, 53))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def flood(seconds):
+    methods = (flood_icmp, flood_udp_dns, flood_tcp_https, flood_ipv6)
+    sent = 0
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        for method in methods:
+            if method():
+                sent += 1
+
+    print("---MIYORI-FLOODNET-BEGIN---", flush=True)
+    print(f"SENT: {sent}", flush=True)
+    print("---MIYORI-FLOODNET-END---", flush=True)
+
+
+def prober(nic, self_mac_str, self_ip, peer_ip):
+    time.sleep(PROBER_DELAY)
+    self_mac = mac_bytes(self_mac_str)
+    lines = []
+
+    gw_mac = arp_query(nic, self_mac, self_ip, GW_IP)
+    lines.append(f"ARP-GW: {gw_mac if gw_mac else 'none'}")
+    lines.append(f"PING-GW: {'ok' if icmp_ping(GW_IP) else 'fail'}")
+    lines.append(f"PING-PEER: {'ok' if peer_ip and icmp_ping(peer_ip) else 'fail'}")
+
+    peer_mac_seen = arp_query(nic, self_mac, self_ip, peer_ip) if peer_ip else None
+    lines.append(f"ARP-PEER: {peer_mac_seen if peer_mac_seen else 'none'}")
+
+    lines.append(f"TCP-PEER: {'ok' if peer_ip and tcp_probe(peer_ip) else 'fail'}")
+
+    if peer_ip:
+        udp_send(peer_ip)
+    lines.append("UDP-PEER: sent")
+
+    udp_send(BCAST_IP, broadcast=True)
+    lines.append("UDP-BCAST: sent")
+
+    spoof_mac_frame(nic, mac_bytes(MIYORI_NET_MAC))
+    lines.append("SPOOF-MAC: sent")
+
+    spoof_ip_packet(GW_IP, peer_ip if peer_ip else GW_IP)
+    lines.append("SPOOF-IP: sent")
+
+    print("---MIYORI-NETPROBE-BEGIN---", flush=True)
+    for line in lines:
+        print(line, flush=True)
+    print("---MIYORI-NETPROBE-END---", flush=True)
+
+
+def hostprobe(nic, self_mac_str, self_ip, host_ips):
+    """Ведёт себя как враждебный спейс: пытается достучаться до хоста и LAN в обход miyori-net."""
+    time.sleep(PROBER_DELAY)
+    self_mac = mac_bytes(self_mac_str)
+    lines = []
+
+    # положительный контроль тот же, что в тесте 51: ARP лежит вне table inet и отвечает всегда
+    gw_mac = arp_query(nic, self_mac, self_ip, GW_IP)
+    lines.append(f"ARP-GW: {gw_mac if gw_mac else 'none'}")
+
+    for ip in host_ips:
+        # маршрут по умолчанию ведёт в miyori-net, поэтому враждебный спейс кладёт прямой on-link
+        os.system(f"ip route replace {ip}/32 dev {nic} 2>/dev/null")
+        mac = arp_query(nic, self_mac, self_ip, ip)
+        lines.append(f"ARP-DIRECT {ip}: {mac if mac else 'none'}")
+        lines.append(f"PING-DIRECT {ip}: {'ok' if icmp_ping(ip) else 'fail'}")
+
+    # гость глушит IPv6 сам, но враждебный спейс его вернёт — проверяем именно это
+    os.system("echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null")
+    os.system(f"ip link set {nic} down; ip link set {nic} up 2>/dev/null")
+    time.sleep(3)
+    lines.append(f"IPV6-OWN: {'есть' if _has_ipv6(nic) else 'нет'}")
+    lines.append(f"IPV6-NEIGH: {_ipv6_neighbours(nic)}")
+
+    print("---MIYORI-HOSTPROBE-BEGIN---", flush=True)
+    for line in lines:
+        print(line, flush=True)
+    print("---MIYORI-HOSTPROBE-END---", flush=True)
+
+
+def _has_ipv6(nic):
+    try:
+        with open(f"/proc/net/if_inet6", encoding="utf-8") as f:
+            return any(line.rstrip().endswith(nic) for line in f)
+    except OSError:
+        return False
+
+
+def _ipv6_neighbours(nic, timeout=5.0):
+    """Эхо на ff02::1 и подсчёт разных ответивших: так враждебный спейс ищет хост на мосту."""
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    except OSError:
+        return "недоступно"
+    s.settimeout(timeout)
+    ident = os.getpid() & 0xFFFF
+    # контрольную сумму ICMPv6 ядро считает само: псевдозаголовок ему известен, нам нет
+    packet = struct.pack("!BBHHH", 128, 0, 0, ident, 1) + LEAK_MARKER + b"v6"
+    responders = set()
+    try:
+        s.sendto(packet, (f"ff02::1%{nic}", 0))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                data, addr = s.recvfrom(1024)
+            except socket.timeout:
+                break
+            if data and data[0] == 129:
+                responders.add(addr[0])
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return len(responders)
+
+
+def exitip(echo_url):
+    """Публичный IP спейса: если туннель работает, это выход VPS, а не адрес провайдера."""
+    import urllib.request
+
+    ip = "none"
+    try:
+        with urllib.request.urlopen(echo_url, timeout=20) as r:
+            ip = r.read(64).decode("ascii", "replace").strip() or "none"
+    except Exception as e:  # причина важнее типа: её читает оператор в консоли
+        ip = f"none ({e})"
+
+    print("---MIYORI-EXITIP-BEGIN---", flush=True)
+    print(f"EXIT-IP: {ip}", flush=True)
+    print("---MIYORI-EXITIP-END---", flush=True)
+
+
+def is_prober_frame(data, prober_ip):
+    if LEAK_MARKER in data:
+        return True
+    if not prober_ip:
+        return False
+    ethertype = struct.unpack("!H", data[12:14])[0]
+    # ни ARP, ни TCP SYN не несут полезной нагрузки — их опознаём по адресу источника
+    if ethertype == 0x0806 and len(data) >= 32:
+        return data[28:32] == socket.inet_aton(prober_ip)
+    if ethertype == 0x0800 and len(data) >= 30:
+        return data[26:30] == socket.inet_aton(prober_ip)
+    return False
+
+
+def listener(nic, self_mac_str, prober_ip):
+    self_mac = mac_bytes(self_mac_str)
+    eth_p_all = 0x0003
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(eth_p_all))
+    s.bind((nic, 0))
+    s.settimeout(1.0)
+    leaked, foreign = [], []
+    deadline = time.monotonic() + LISTEN_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            data = s.recv(65535)
+        except socket.timeout:
+            continue
+        if data[6:12] == self_mac:
+            continue
+        dst_s = ":".join(f"{b:02x}" for b in data[0:6])
+        src_s = ":".join(f"{b:02x}" for b in data[6:12])
+        ethertype = struct.unpack("!H", data[12:14])[0]
+        line = f"src={src_s} dst={dst_s} ethertype=0x{ethertype:04x} len={len(data)}"
+        (leaked if is_prober_frame(data, prober_ip) else foreign).append(line)
+    s.close()
+
+    print("---MIYORI-NETRECV-BEGIN---", flush=True)
+    print(f"FRAMES: {len(leaked)}", flush=True)
+    print(f"FOREIGN: {len(foreign)}", flush=True)
+    for line in leaked:
+        print(f"LEAK {line}", flush=True)
+    for line in foreign:
+        print(f"OTHER {line}", flush=True)
+    print("---MIYORI-NETRECV-END---", flush=True)
+
+
+if __name__ == "__main__":
+    role = sys.argv[1]
+    if role == "listener":
+        listener(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else "")
+    elif role == "prober":
+        peer_arg = sys.argv[5] if len(sys.argv) > 5 else ""
+        prober(sys.argv[2], sys.argv[3], sys.argv[4], peer_arg or None)
+    elif role == "exitip":
+        exitip(sys.argv[2])
+    elif role == "flood":
+        flood(int(sys.argv[2]))
+    elif role == "hostprobe":
+        ips = sys.argv[5].split(",") if len(sys.argv) > 5 else []
+        hostprobe(sys.argv[2], sys.argv[3], sys.argv[4], [a for a in ips if a])
+    else:
+        raise SystemExit(f"неизвестная роль {role}")

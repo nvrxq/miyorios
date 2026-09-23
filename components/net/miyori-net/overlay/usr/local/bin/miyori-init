@@ -1,0 +1,526 @@
+#!/bin/sh
+# miyori-net стартует как PID 1 и сам монтирует базовые ФС, как guest/init.sh в M1
+set -eu
+
+: "${MIYORI_UPLINK:=none}"
+: "${MIYORI_VPS_ALLOW:=}"
+
+spaces_mac="52:54:00:6d:59:01"
+captive_mac="52:54:00:6d:59:02"
+# пятый октет иной, чем у спейсов: их MAC выводится как 52:54:00:6d:59:<cid>, и :03 занял бы CID 3
+host_mac="52:54:00:6d:5a:01"
+
+mount -t proc     proc /proc || true
+mount -t sysfs    sys  /sys  || true
+mount -t devtmpfs dev  /dev  || true
+mount -t tmpfs    run  /run  || true
+# output-политика матчит по этой cgroup, а не по IP VPS: адрес в git попадать не должен
+mount -t cgroup2 cgroup2 /sys/fs/cgroup || echo "MIYORI: mount cgroup2 не удался"
+mkdir -p /sys/fs/cgroup/tunnel || echo "MIYORI: mkdir cgroup tunnel не удался"
+
+# -a обязателен: без него это один модуль с параметрами "virtio_net" и "virtio_blk".
+# vmw_vsock_virtio_transport здесь по той же причине, что и в guest/init.sh: без udev
+# ядро подгружает только PF_VSOCK, а без транспорта connect из гостя не уходит никуда
+modprobe -a virtio_pci virtio_net virtio_blk vmw_vsock_virtio_transport \
+	|| echo "MIYORI: modprobe virtio не удался"
+# CONFIG_TUN=y в этом ядре — модуль встроен, modprobe тут безопасный no-op на случай другого ядра
+modprobe tun || echo "MIYORI: modprobe tun не удался"
+if [ "$MIYORI_UPLINK" = "vfio" ]; then
+	modprobe r8169 || echo "MIYORI: modprobe r8169 не удался"
+fi
+
+# без udev имена интерфейсов нестабильны — опознаём стороны по MAC, а не по eth-имени
+find_iface_by_mac() {
+	addr="$1"
+	for f in /sys/class/net/*/address; do
+		[ -f "$f" ] || continue
+		if [ "$(cat "$f")" = "$addr" ]; then
+			basename "$(dirname "$f")"
+			return 0
+		fi
+	done
+	return 1
+}
+
+find_iface_by_driver() {
+	drv="$1"
+	for dev in /sys/class/net/*; do
+		[ -e "$dev/device/driver" ] || continue
+		if [ "$(basename "$(readlink -f "$dev/device/driver")")" = "$drv" ]; then
+			basename "$dev"
+			return 0
+		fi
+	done
+	return 1
+}
+
+iface_driver() {
+	if [ -e "/sys/class/net/$1/device/driver" ]; then
+		basename "$(readlink -f "/sys/class/net/$1/device/driver")"
+	else
+		echo "неизвестен"
+	fi
+}
+
+# tc-часть eBPF-гейта оператора цепляется ко всему, что не подошло под её skip-префиксы
+# (lo, wg, tun, tap, vpn, docker, veth, virbr, br-, ...). Имя вида enp0s4 под них не подходит,
+# и на egress этой карты гейт убил бы ответы спейсам: их адреса в его списке не значатся
+rename_out_of_tc() {
+	[ -n "$1" ] || return 0
+	ip link set "$1" down 2>/dev/null || true
+	ip link set "$1" name "$2" 2>/dev/null || { ip link set "$1" up 2>/dev/null || true; printf '%s' "$1"; return 0; }
+	printf '%s' "$2"
+}
+
+spaces_ifc="$(find_iface_by_mac "$spaces_mac" || true)"
+spaces_ifc="$(rename_out_of_tc "$spaces_ifc" veth-spaces)"
+[ -z "$spaces_ifc" ] || ip link set "$spaces_ifc" up || true
+[ -z "$spaces_ifc" ] || ip addr add 10.59.0.1/24 dev "$spaces_ifc" || true
+
+# линк до хоста есть только при --host-link — интерфейс опознаём по MAC, как spaces_ifc выше
+host_ifc="$(find_iface_by_mac "$host_mac" || true)"
+host_ifc="$(rename_out_of_tc "$host_ifc" veth-host)"
+[ -z "$host_ifc" ] || ip link set "$host_ifc" up || true
+[ -z "$host_ifc" ] || ip addr add 10.60.0.1/30 dev "$host_ifc" || true
+
+case "$MIYORI_UPLINK" in
+	captive) uplink_ifc="$(find_iface_by_mac "$captive_mac" || true)" ;;
+	vfio)    uplink_ifc="$(find_iface_by_driver r8169 || true)" ;;
+	*)       uplink_ifc="" ;;
+esac
+
+killswitch_pid=""
+
+nft -f /etc/nftables.conf || echo "MIYORI: nft -f не удался"
+
+# дыра: у output исключение под cgroup tunnel пускает и exit-исход direct sing-box — без списка это открытый текст наружу
+if [ -n "$MIYORI_VPS_ALLOW" ]; then
+	vps_elements="$(
+		IFS=,
+		# shellcheck disable=SC2086 # разбиение по IFS=, тут и есть цель
+		set -- $MIYORI_VPS_ALLOW
+		out=""
+		for ip in "$@"; do
+			out="${out:+$out, }$ip"
+		done
+		printf '%s' "$out"
+	)"
+	nft add set inet miyori vps '{ type ipv4_addr; }' || echo "MIYORI: nft add set vps не удался"
+	nft add element inet miyori vps "{ $vps_elements }" || echo "MIYORI: nft add element vps не удался"
+	# разрешение по списку добавляем ДО удаления cgroup-правила — иначе окно, где nekobox не выходит вовсе
+	nft add rule inet miyori output ip daddr @vps accept || echo "MIYORI: nft add rule ip daddr @vps не удался"
+	cgroup_handle="$(nft -a list chain inet miyori output | awk '/socket cgroupv2/ { print $NF }')"
+	if [ -n "$cgroup_handle" ]; then
+		nft delete rule inet miyori output handle "$cgroup_handle" \
+			|| echo "MIYORI: nft delete rule cgroup handle $cgroup_handle не удался"
+	else
+		echo "MIYORI: handle cgroup-правила не найден — output остаётся открыт мимо списка VPS"
+	fi
+else
+	echo "MIYORI: MIYORI_VPS_ALLOW пуст — выход мимо туннеля НЕ заперт, исход direct уйдёт открытым текстом"
+fi
+
+# только vfio видит физическую карту; captive/none — синтетика без DHCP-сервера, звать клиента там незачем
+if [ "$MIYORI_UPLINK" = "vfio" ] && [ -n "$uplink_ifc" ]; then
+	ip link set "$uplink_ifc" up || echo "MIYORI: ip link up $uplink_ifc не удался"
+	mkdir -p /var/lib/dhcp || echo "MIYORI: mkdir /var/lib/dhcp не удался"
+	timeout 15 dhclient -1 "$uplink_ifc" || echo "MIYORI: dhclient на $uplink_ifc не получил адрес"
+fi
+
+# бинарь оператора; в репозитории его нет и быть не должно — см. документации проекта.
+# Место выбрано замером: фильтр запрещает всё, чего нет в его списке, включая DHCP, поэтому
+# он обязан подниматься ПОСЛЕ dhclient, но ДО ip_forward — иначе либо аплинк без адреса,
+# либо окно, в котором трафик спейсов уходит мимо фильтра
+if [ -x /usr/local/bin/miyori-killswitch ] && [ "${MIYORI_KILLSWITCH:-on}" != "off" ]; then
+	mount -t bpf bpf /sys/fs/bpf || echo "MIYORI: mount bpf не удался"
+	# NET_CLS_BPF/NET_ACT_BPF в этом ядре модули, а не встроены — без них tc-BPF не поднимется
+	modprobe -a cls_bpf act_bpf sch_ingress || echo "MIYORI: modprobe tc-bpf не удался"
+	# без udev имена интерфейсов нестабильны — загрузчик получает их готовыми, а не угадывает сам
+	# фоном: резидентный загрузчик иначе повесил бы загрузку miyori-net навсегда
+	# второй серийный порт заведён под гейт: смешанный с консолью, его поток топит журнал юнита
+	if [ -c /dev/ttyS1 ]; then
+		ksw_out=/dev/ttyS1
+		echo "MIYORI: журнал гейта уходит на второй порт — build/miyori-net/killswitch.log"
+	else
+		ksw_out=/dev/console
+		echo "MIYORI: /dev/ttyS1 нет, журнал гейта пойдёт в консоль вместе со всем остальным"
+	fi
+	MIYORI_UPLINK_IFC="$uplink_ifc" MIYORI_SPACES_IFC="$spaces_ifc" \
+		/usr/local/bin/miyori-killswitch >"$ksw_out" 2>&1 &
+	killswitch_pid=$!
+fi
+
+# policy accept: без списка VPS трафик туннеля тут отличим только по его адресу, а ему в git не место
+load_netdev_permissive() {
+	nft -f - <<NFTEOF || echo "MIYORI: netdev-фильтр аплинка не загрузился"
+table netdev miyori {
+	chain uplink_egress {
+		type filter hook egress device "$uplink_ifc" priority 0; policy accept;
+		ip saddr 10.59.0.0/24 counter drop
+		ip daddr 10.59.0.0/24 counter drop
+		ip saddr 10.60.0.0/30 counter drop
+		ip daddr 10.60.0.0/30 counter drop
+	}
+}
+NFTEOF
+}
+
+# последний рубеж на самой карте: хук egress семейства netdev видит кадр после форварда,
+# после маршрутов и мимо netfilter (AF_PACKET), поэтому ловит и нашу собственную ошибку
+if [ -n "$uplink_ifc" ]; then
+	if [ -n "$MIYORI_VPS_ALLOW" ]; then
+		# ether type arp обязателен: policy drop на этом хуке рубит и ARP, а без него связь пропадает целиком
+		if nft -f - <<NFTEOF
+table netdev miyori {
+	set vps { type ipv4_addr; elements = { $vps_elements } }
+	chain uplink_egress {
+		type filter hook egress device "$uplink_ifc" priority 0; policy drop;
+		ether type arp accept
+		udp sport 68 udp dport 67 accept
+		ip daddr @vps counter accept
+		counter drop
+	}
+}
+NFTEOF
+		then
+			:
+		else
+			# без отката слой на карте исчез бы целиком и молча — худший из возможных исходов
+			echo "MIYORI: строгий netdev-фильтр не загрузился, откат на разрешающий — выход мимо VPS на карте НЕ заперт"
+			load_netdev_permissive
+		fi
+	else
+		load_netdev_permissive
+	fi
+fi
+
+# форвардинг включаем только после загрузки правил — иначе окно гонки открывает выход без фильтра (тест 55)
+# sysctl не заведён отдельным пакетом (procps в packages.list нет) — пишем прямо в procfs
+echo 1 > /proc/sys/net/ipv4/ip_forward || echo "MIYORI: ip_forward не удался"
+
+# ответ резолвера идёт с 10.59.0.1/10.60.0.1, и правила ниже загнали бы его в туннель вместо линка
+ip rule add from 10.59.0.1 to 10.59.0.0/24 lookup main priority 98 || echo "MIYORI: ip rule 98 не удался"
+ip rule add from 10.60.0.1 to 10.60.0.0/30 lookup main priority 99 || echo "MIYORI: ip rule 99 не удался"
+
+# находка теста 54: kill-switch только на фильтре открывается от flush ruleset. Трафику спейсов
+# оставлена одна таблица маршрутов; пуста она — работает unreachable, а не main с её uplink
+ip rule add from 10.59.0.0/24 lookup 100 priority 100 || echo "MIYORI: ip rule 100 не удался"
+ip rule add from 10.59.0.0/24 type unreachable priority 101 || echo "MIYORI: ip rule 101 не удался"
+# хост на тех же правах, что спейс: иначе при упавшем туннеле его трафик утечёт в main
+ip rule add from 10.60.0.0/30 lookup 100 priority 102 || echo "MIYORI: ip rule 102 не удался"
+ip rule add from 10.60.0.0/30 type unreachable priority 103 || echo "MIYORI: ip rule 103 не удался"
+
+# тест 14: sing-box никогда не называет туннель tun0 — заводим интерфейс с другим именем,
+# чтобы поиск по префиксу ниже искал по-настоящему, а не совпадал с литералом случайно
+if [ "${MIYORI_KILLSWITCH_TEST:-none}" = "tunnel-probe" ]; then
+	ip tuntap add dev tun_probe mode tun || echo "MIYORI: tuntap add tun_probe не удался"
+	ip link set tun_probe up || echo "MIYORI: link up tun_probe не удался"
+fi
+
+# tun0 оснастки и настоящий tun_xxxx sing-box ищутся одним и тем же кодом — префикс, а не литерал
+find_tunnel_ifc() {
+	for f in /sys/class/net/tun*; do
+		[ -e "$f" ] || continue
+		name="$(basename "$f")"
+		# tunl0 заводит модуль ipip, к туннелю nekobox он отношения не имеет
+		[ "$name" != "tunl0" ] || continue
+		printf '%s\n' "$name"
+		return 0
+	done
+	return 1
+}
+
+# маршрут в найденный туннель ядро само убирает вместе с устройством — цикл нужен только чтобы его вернуть,
+# а @tunnels держим равным ровно найденному имени, иначе там накопится мусор от исчезнувших интерфейсов
+tunnel_synced=""
+# состояние туннеля печатается один раз на старте, а меняется потом: без этого «трафик не идёт»
+# снаружи неотличимо от «туннель поднялся, но политика его не пустила»
+tunnel_reported="не печатали"
+report_tunnel() {
+	[ "$1" != "$tunnel_reported" ] || return 0
+	tunnel_reported="$1"
+	if [ -z "$1" ]; then
+		echo "MIYORI: туннеля нет — трафик спейсов и хоста заперт"
+	else
+		echo "MIYORI: туннель $1 поднят"
+	fi
+}
+
+sync_tunnel_state() {
+	tunnel_ifc="$(find_tunnel_ifc || true)"
+	if [ -z "$tunnel_ifc" ]; then
+		report_tunnel ""
+		[ -z "$tunnel_synced" ] || nft flush set inet miyori tunnels 2>/dev/null || true
+		tunnel_synced=""
+		return 0
+	fi
+	report_tunnel "$tunnel_ifc"
+	ip route replace default dev "$tunnel_ifc" table 100 2>/dev/null || true
+	# flush только при смене имени: он открывает окно, в котором множество пусто, а add идемпотентен
+	[ "$tunnel_ifc" = "$tunnel_synced" ] || nft flush set inet miyori tunnels 2>/dev/null || true
+	# add зовём каждый раз: иначе очистка ruleset снаружи оставила бы туннель заблокированным навсегда
+	if nft add element inet miyori tunnels "{ $tunnel_ifc }" 2>/dev/null; then
+		tunnel_synced="$tunnel_ifc"
+	fi
+}
+
+# первый прогон синхронный: печать секции TUNNEL ниже требует, чтобы цикл уже успел отработать хоть раз
+sync_tunnel_state || true
+
+(
+	while true; do
+		sleep 2
+		sync_tunnel_state || true
+		# dhclient возвращает сюда адрес провайдера на каждом продлении аренды, и с этого
+		# момента имена сетевой машины уходили бы мимо собственного резолвера
+		grep -qx 'nameserver 10.60.0.1' /etc/resolv.conf 2>/dev/null \
+			|| printf 'nameserver 10.60.0.1\n' > /etc/resolv.conf
+	done
+) &
+
+# в cgroup tunnel резолвер намеренно НЕ кладём: она исключение из output-политики, и с ней
+# его DoH ушёл бы на карту мимо туннеля. Без неё выход один — @tunnels, иначе отказ
+dnscrypt_pid=""
+if [ -x /usr/sbin/dnscrypt-proxy ]; then
+	mkdir -p /var/cache/dnscrypt-proxy
+	/usr/sbin/dnscrypt-proxy -config /etc/dnscrypt-proxy/dnscrypt-proxy.toml &
+	dnscrypt_pid=$!
+else
+	echo "MIYORI: dnscrypt-proxy не найден — хост и спейсы останутся на DNS провайдера"
+fi
+
+# "live servers" в логе резолвера не значит, что ответ дошёл: это видно только настоящим запросом
+(
+	i=0
+	ok=0
+	# одной попытки мало: и туннель, и сам резолвер готовы позже этого места в загрузке
+	while [ "$i" -lt 45 ]; do
+		# dhclient переписывает resolv.conf адресом провайдера — возвращаем свой на каждой попытке
+		printf 'nameserver 10.60.0.1\n' > /etc/resolv.conf
+		if getent hosts example.com >/dev/null 2>&1; then ok=1; break; fi
+		i=$((i + 1))
+		sleep 2
+	done
+	if [ "$ok" = "1" ]; then
+		echo "DNSCRYPT-SELFTEST: ok за $((i * 2))с"
+	elif timeout 5 bash -c 'exec 3<>/dev/tcp/1.0.0.1/443' 2>/dev/null; then
+		echo "DNSCRYPT-SELFTEST: FAIL — наверх дорога есть, дело в самом резолвере"
+	else
+		echo "DNSCRYPT-SELFTEST: FAIL — своим трафиком машина наружу не ходит, резолверу некуда идти"
+	fi
+) &
+
+# VERIFY 53-55: без независимого маршрута приманки исчезновение tun0 не даёт пакетам маршрута вообще,
+# и ноль кадров на tap-captive ничего не доказывает — сценарии гейта M2, не рабочий режим
+# трафик спейсов теперь гибнет до netfilter, поэтому доставку доказывает счётчик приёма, а не drop
+in_receives() {
+	awk '/^Ip:/ { if (!h) { for (i = 2; i <= NF; i++) idx[$i] = i; h = 1; next } print $idx["InReceives"] }' /proc/net/snmp
+}
+
+: "${MIYORI_KILLSWITCH_TEST:=none}"
+# tunnel-probe и vps-direct — своя оснастка, не 53-55: у них свои сценарии, сюда не заходят
+if [ "$MIYORI_KILLSWITCH_TEST" != "none" ] && [ "$MIYORI_KILLSWITCH_TEST" != "tunnel-probe" ] \
+	&& [ "$MIYORI_KILLSWITCH_TEST" != "vps-direct" ]; then
+	if [ -z "$uplink_ifc" ]; then
+		echo "MIYORI: MIYORI_KILLSWITCH_TEST=$MIYORI_KILLSWITCH_TEST, но uplink не найден"
+	else
+		(
+			set +e
+			ip link set "$uplink_ifc" up
+			ip neigh replace 1.1.1.1 lladdr 52:54:00:ba:11:01 dev "$uplink_ifc"
+			ip route add 1.1.1.1/32 dev "$uplink_ifc" metric 200
+			bring_tun0() {
+				ip tuntap add dev tun0 mode tun
+				ip link set tun0 up
+				ip route add 1.1.1.1/32 dev tun0 metric 100
+			}
+			[ "$MIYORI_KILLSWITCH_TEST" = "boot-race" ] || bring_tun0
+			echo "---MIYORI-KILLSWITCH-T0-BEGIN---"
+			echo "IN-RECEIVES: $(in_receives)"
+			echo "---MIYORI-KILLSWITCH-T0-END---"
+			# 30 c — тесты 53/54 ждут загрузки miyori-net перед стартом спейса (sleep 20 в самом тесте)
+			sleep 30
+			# тест читает счётчик именно этого блока — без него "ноль на tap-captive" не отличить
+			# от "правило форварда никогда не срабатывало" (см. VERIFY 53-55)
+			echo "---MIYORI-KILLSWITCH-PRE-BEGIN---"
+			echo "IN-RECEIVES: $(in_receives)"
+			nft list chain inet miyori forward
+			echo "---MIYORI-KILLSWITCH-PRE-END---"
+			# оснастка VERIFY 57: оба верхних слоя снимаются целиком (delete, а не flush —
+			# у flush остаётся chain с policy drop), чтобы кадр спейса дошёл до самой карты
+			open_upper_layers() {
+				ip link del tun0
+				nft delete table inet miyori
+				ip rule del from 10.59.0.0/24 lookup 100 priority 100
+				ip rule del from 10.59.0.0/24 type unreachable priority 101
+			}
+			case "$MIYORI_KILLSWITCH_TEST" in
+				tunnel-down)   ip link del tun0 ;;
+				policy-reload) ip link del tun0; sleep 2; nft flush ruleset ;;
+				boot-race)     bring_tun0 ;;
+				netdev-leak)   open_upper_layers ;;
+				# положительный контроль: без netdev-таблицы тот же кадр обязан дойти до tap-captive
+				netdev-leak-control) open_upper_layers; nft delete table netdev miyori ;;
+			esac
+			sleep 15
+			echo "---MIYORI-KILLSWITCH-POST-BEGIN---"
+			echo "IN-RECEIVES: $(in_receives)"
+			nft list chain inet miyori forward
+			# счётчик netdev-цепочки: без него "ноль на tap-captive" не отличить от "кадр не дошёл до карты"
+			nft list table netdev miyori
+			echo "---MIYORI-KILLSWITCH-POST-END---"
+		) &
+	fi
+fi
+
+# vps-direct: проверяет список правки 1/2, а не сам туннель — исход direct sing-box идёт из cgroup tunnel
+if [ "$MIYORI_KILLSWITCH_TEST" = "vps-direct" ]; then
+	if [ -z "$uplink_ifc" ]; then
+		echo "MIYORI: MIYORI_KILLSWITCH_TEST=vps-direct, но uplink не найден"
+	else
+		(
+			set +e
+			ip link set "$uplink_ifc" up
+			# приём тот же, что и у 1.1.1.1 выше: on-link сосед и маршрут в обход DHCP-шлюза
+			ip neigh replace 1.1.1.1 lladdr 52:54:00:ba:11:01 dev "$uplink_ifc"
+			ip route add 1.1.1.1/32 dev "$uplink_ifc" metric 200
+			ip neigh replace 1.0.0.1 lladdr 52:54:00:ba:11:02 dev "$uplink_ifc"
+			ip route add 1.0.0.1/32 dev "$uplink_ifc" metric 200
+			n=5
+			i=0
+			while [ "$i" -lt "$n" ]; do
+				( echo 0 > /sys/fs/cgroup/tunnel/cgroup.procs; exec bash -c 'echo probe > /dev/udp/1.1.1.1/9' ) || true
+				( echo 0 > /sys/fs/cgroup/tunnel/cgroup.procs; exec bash -c 'echo probe > /dev/udp/1.0.0.1/9' ) || true
+				i=$((i + 1))
+				sleep 1
+			done
+			echo "---MIYORI-VPSDIRECT-BEGIN---"
+			echo "ALLOWED-SENT: $n"
+			echo "BLOCKED-SENT: $n"
+			echo "---MIYORI-VPSDIRECT-END---"
+		) &
+	fi
+fi
+
+echo "---MIYORI-NET-BEGIN---"
+
+echo "---MIYORI-NIC-BEGIN---"
+ip -o link || true
+echo "---MIYORI-NIC-END---"
+
+echo "---MIYORI-UPLINK-BEGIN---"
+echo "MIYORI_UPLINK=$MIYORI_UPLINK"
+if [ -n "$uplink_ifc" ]; then
+	echo "UPLINK: $uplink_ifc driver=$(iface_driver "$uplink_ifc")"
+	# тест 13 читает факт, а не догадывается: пусто/адреса нет печатаем как "none", а не молчим
+	addr="$(ip -4 -o addr show dev "$uplink_ifc" | awk '{print $4}' | head -1)"
+	echo "UPLINK-ADDR: ${addr:-none}"
+	route="$(ip -4 route show default dev "$uplink_ifc" | head -1)"
+	echo "UPLINK-ROUTE: ${route:-none}"
+else
+	echo "UPLINK: не найден"
+fi
+echo "---MIYORI-UPLINK-END---"
+
+echo "---MIYORI-TUNNEL-BEGIN---"
+# все три строки снимаются в момент печати, а не из снимка загрузки: туннель поднимается позже
+echo "TUNNEL-IFC: $(find_tunnel_ifc || echo none)"
+echo "TUNNEL-SET: $(nft list set inet miyori tunnels 2>/dev/null | tr '\n' ' ')"
+echo "TUNNEL-ROUTE: $(ip -4 route show table 100 2>/dev/null | tr '\n' ' ')"
+echo "---MIYORI-TUNNEL-END---"
+
+echo "---MIYORI-NFT-BEGIN---"
+nft list ruleset || true
+echo "---MIYORI-NFT-END---"
+
+echo "---MIYORI-NET-END---"
+
+: "${MIYORI_PORT:=1700}"
+
+# постоянный том: overlay корня одноразовый, а после задачи 8 хосту нечем будет переподключить VPS-профиль
+data_mounted="fail"
+if [ -b /dev/vdb ]; then
+	dumpe2fs -h /dev/vdb >/dev/null 2>&1 || mkfs.ext4 -q /dev/vdb \
+		|| echo "MIYORI: mkfs.ext4 /dev/vdb не удался"
+	mkdir -p /mnt/data /opt/nekobox/settings
+	if mount /dev/vdb /mnt/data && mount --bind /mnt/data /opt/nekobox/settings; then
+		data_mounted="ok"
+	fi
+else
+	echo "MIYORI: нет /dev/vdb — постоянный том не подключен"
+fi
+
+# waypipe отказывается стартовать без этой переменной (main.rs:2631), см. guest/init.sh
+XDG_RUNTIME_DIR=/run/miyori
+export XDG_RUNTIME_DIR
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# Qt в бандле, не в системе: nekobox сам не знает про /opt/nekobox, ему нужны все три переменные
+export QT_QPA_PLATFORM=wayland
+export QT_PLUGIN_PATH=/opt/nekobox/usr/plugins
+export LD_LIBRARY_PATH=/opt/nekobox/usr/lib
+
+# cgroup.procs понимает "0" как "переместить вызывающий процесс" — это сам себя переносит waypipe до exec
+(echo 0 > /sys/fs/cgroup/tunnel/cgroup.procs 2>/dev/null || echo "MIYORI: cgroup tunnel не сработал"
+ exec /usr/local/bin/waypipe --vsock -c none -s "$MIYORI_PORT" server -- /opt/nekobox/nekobox) &
+
+# ищем сам nekobox, а не обёртку: waypipe переживёт нехватку библиотеки, а nekobox нет
+nekobox_alive() {
+	for p in /proc/[0-9]*; do
+		[ "$(cat "$p/comm" 2>/dev/null)" = "nekobox" ] || continue
+		grep -q '^State:[[:space:]]*Z' "$p/status" 2>/dev/null && continue
+		return 0
+	done
+	return 1
+}
+
+sleep 5
+alive="no"
+nekobox_alive && alive="yes"
+
+# $killswitch_pid — тот же приём, что nekobox_alive: живой процесс, а не PID-файл на диске
+killswitch_status="нет файла"
+[ "${MIYORI_KILLSWITCH:-on}" != "off" ] || killswitch_status="выключен флагом"
+if [ -n "$killswitch_pid" ]; then
+	# зомби у PID 1 не исчезает, пока его не пожали: без проверки State вышедший загрузчик числился бы живым
+	if [ -d "/proc/$killswitch_pid" ] \
+		&& ! grep -q '^State:[[:space:]]*Z' "/proc/$killswitch_pid/status" 2>/dev/null; then
+		killswitch_status="жив"
+	else
+		killswitch_status="вышел"
+	fi
+fi
+
+btf_status="нет"
+[ -r /sys/kernel/btf/vmlinux ] && btf_status="да"
+
+# зомби у PID 1 живым не считаем — та же ловушка, что и с гейтом
+dnscrypt_status="не запускали"
+if [ -n "$dnscrypt_pid" ]; then
+	if [ -d "/proc/$dnscrypt_pid" ] \
+		&& ! grep -q '^State:[[:space:]]*Z' "/proc/$dnscrypt_pid/status" 2>/dev/null; then
+		dnscrypt_status="жив"
+	else
+		dnscrypt_status="вышел"
+	fi
+fi
+
+echo "---MIYORI-GUI-BEGIN---"
+echo "DATA-MOUNT: $data_mounted /opt/nekobox/settings"
+echo "WAYPIPE-PORT: $MIYORI_PORT"
+echo "NEKOBOX-ALIVE: $alive"
+echo "KILLSWITCH: $killswitch_status"
+echo "DNSCRYPT: $dnscrypt_status"
+echo "BTF: $btf_status"
+echo "---MIYORI-GUI-END---"
+
+# роутер не должен падать вместе с GUI и не выключает себя сразу после отчёта; VM снимает стенд по таймауту
+# шелл только по явному флагу запуска: в обычном образе консоль уходит в журнал, где stdin закрыт,
+# и постоянный getty был бы просто root-шеллом на серийном порту доверенной машины
+if [ "${MIYORI_DEBUG_SHELL:-0}" = "1" ]; then
+	echo "MIYORI: отладочный шелл на консоли, выход из него перезапускает шелл, а не машину"
+	while true; do sh -i || true; sleep 1; done
+else
+	while true; do sleep 3600; done
+fi

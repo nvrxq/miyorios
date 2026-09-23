@@ -1,0 +1,79 @@
+id = "miyori-net"
+description = "Сетевой узел: единственный выход всей системы наружу"
+
+[base]
+builder = "mmdebstrap"
+suite   = "noble"
+sources = [
+  "deb http://archive.ubuntu.com/ubuntu noble main universe",
+  "deb http://archive.ubuntu.com/ubuntu noble-updates main universe",
+  "deb http://security.ubuntu.com/ubuntu noble-security main universe",
+]
+# ca-certificates: sing-box резолвит через DNS-over-TLS и без корневых сертификатов
+# роняет каждый запрос на "certificate signed by unknown authority" при живом туннеле
+packages = [
+  "iproute2", "nftables", "isc-dhcp-client", "linux-image-generic", "initramfs-tools", "kmod",
+  "ca-certificates",
+  "libx11-6", "libxcb1", "libxau6", "libxdmcp6", "libice6", "libsm6",
+  "libegl1", "libglx0", "libopengl0", "libfontconfig1", "libfreetype6",
+  "libharfbuzz0b", "libgraphite2-3", "libbrotli1", "libbsd0", "libexpat1",
+  "libstdc++6", "fonts-dejavu-core", "e2fsprogs",
+  # резолвер сетевой машины: наверх только по DoH и только через туннель — cgroup tunnel
+  # ему намеренно не даётся, она исключение из output-политики (см. miyori-init).
+  # Новая зависимость в TCB сетевой машины — решение оператора от 2026-09-02
+  "dnscrypt-proxy",
+]
+firmware_include = ["rtl_nic"]
+
+[[base.blob]]
+path   = "blobs/nekobox-5.11.28.1-linux-amd64.tar.gz"
+sha256 = "f05569575a8673c4bf0aa1c2e6220eee243d67779b1bade1ccf213fc427cf747"
+into   = "/opt"
+strip  = 0
+
+# eBPF-киллсвитч оператора. Бинарь и его конфиг в git не лежат (/blobs в .gitignore):
+# в TCB сетевой машины он попадает по решению оператора, sha256 держит ровно ту сборку, что проверена.
+# Адрес VPS живёт в его конфиге и в репозиторий не попадает
+[[base.file]]
+path   = "blobs/hiverd-opsec"
+sha256 = "8faa5bd17ee68b0f98021cdba78c39478adb7a7a28b471f92b1cde12ea767480"
+into   = "/usr/local/bin/hiverd-opsec"
+mode   = "0755"
+
+# порядок путей поиска у самого бинаря: OPSEC_EBPF_PATH, /usr/local/lib/hiver, /usr/lib/hiver
+[[base.file]]
+path   = "blobs/opsec.bpf.o"
+sha256 = "78777273ffc46dabae8f188a009315c5cb9ef59b90a1bac19d8d724f77660a10"
+into   = "/usr/local/lib/hiver/opsec.bpf.o"
+mode   = "0644"
+
+[[base.file]]
+path   = "blobs/hiver-config.toml"
+sha256 = "579d85e81a97d613616db25816811d8e8671a6c076813d628fc638493d813843"
+into   = "/etc/hiver/config.toml"
+mode   = "0600"
+
+# miyori-init зовёт одно имя без аргументов — обёртка подставляет сокет, конфиг и секцию
+[[base.file]]
+path   = "blobs/miyori-killswitch"
+sha256 = "2906706122c7de1bd66a243b4d66a49f9fcea30bd9aba33037837b3107783009"
+into   = "/usr/local/bin/miyori-killswitch"
+mode   = "0755"
+
+[app]
+mode    = "app"
+command = "/opt/nekobox/nekobox"
+
+[resources]
+memory_mb = 1024
+cpus      = 1
+disk_gb   = 2
+data_mb   = 256
+
+[isolation]
+level = "standard"
+gpu   = "none"
+
+[network]
+via = "miyori-net"
+

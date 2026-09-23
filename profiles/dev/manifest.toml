@@ -1,0 +1,36 @@
+id = "dev"
+description = "Рабочий спейс: терминал, git, curl, браузер. Остальное оператор ставит внутри руками"
+
+[base]
+builder = "mmdebstrap"
+suite   = "noble"
+sources = [
+  "deb http://archive.ubuntu.com/ubuntu noble main universe",
+  "deb http://archive.ubuntu.com/ubuntu noble-updates main universe",
+  "deb http://security.ubuntu.com/ubuntu noble-security main universe",
+]
+# node из архива не ставим намеренно: там 18.19, а Claude Code требует >= 22 — его тянут внутрь руками
+packages = [
+  "systemd-sysv", "iproute2", "nftables", "linux-image-virtual", "initramfs-tools", "e2fsprogs",
+  "ca-certificates", "dbus", "fonts-dejavu-core", "fonts-liberation2",
+  "foot", "fonts-jetbrains-mono", "fonts-noto-color-emoji",
+  "git", "curl", "xz-utils", "unzip", "less", "nano", "openssh-client",
+  "epiphany-browser", "dconf-gsettings-backend",
+]
+
+[app]
+mode    = "app"
+command = "/usr/local/bin/miyori-app"
+
+[resources]
+memory_mb = 4096
+cpus      = 4
+disk_gb   = 16
+data_mb   = 8192
+
+[isolation]
+level = "standard"
+gpu   = "none"
+
+[network]
+via = "miyori-net"

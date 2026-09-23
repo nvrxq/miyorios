@@ -1,0 +1,8 @@
+#!/bin/sh
+# запускается waypipe-сервером, поэтому WAYLAND_DISPLAY уже выставлен им
+echo "---MIYORI-GLOBALS-BEGIN---"
+wayland-info || echo "wayland-info не отработал"
+echo "---MIYORI-GLOBALS-END---"
+# без exec: закрытое окно должно быть видно в консоли, а не выглядеть как молчание
+SHELL=/usr/local/bin/miyori-spoof weston-terminal
+echo "MIYORI: weston-terminal завершился с кодом $?, аптайм $(cat /proc/uptime)"

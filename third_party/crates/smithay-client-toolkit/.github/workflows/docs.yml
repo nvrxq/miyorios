@@ -1,0 +1,35 @@
+name: Deploy Docs to GitHub Pages
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  doc:
+    name: Documentation on Github Pages
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+
+      - name: Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install system dependencies
+        run: sudo apt-get install libxkbcommon-dev libwayland-dev
+
+      - name: Build Documentation
+        run: cargo doc --no-deps
+
+      - name: Setup index
+        run: cp ./doc_index.html ./target/doc/index.html
+
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./target/doc

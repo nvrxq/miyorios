@@ -1,0 +1,189 @@
+#!/bin/sh
+# Гостевая сторона: скрипт стартует как PID 1, поэтому базовые ФС монтирует сам
+set -eu
+: "${MIYORI_PORT:=1700}"
+
+mount -t proc     proc /proc || true
+mount -t sysfs    sys  /sys  || true
+mount -t devtmpfs dev  /dev  || true
+# без devpts weston-terminal не получает псевдотерминал: шелл стартует, ловит EOF, и окно закрывается
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts || true
+mount -t tmpfs    run  /run  || true
+
+# waypipe отказывается стартовать без этой переменной (main.rs:2631)
+XDG_RUNTIME_DIR=/run/miyori
+export XDG_RUNTIME_DIR
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# в госте нет udev: без явного modprobe virtio-устройства остаются без драйвера
+modprobe vmw_vsock_virtio_transport || echo "MIYORI: modprobe vsock не удался"
+modprobe virtio_net || echo "MIYORI: modprobe virtio_net не удался"
+
+echo "---MIYORI-VIRTIO-BEGIN---"
+grep -H . /sys/bus/virtio/devices/*/modalias 2>/dev/null || echo "нет virtio-устройств"
+ls /sys/bus/virtio/drivers 2>/dev/null || true
+echo "---MIYORI-VIRTIO-END---"
+
+# net.ipv6 гасим ДО поднятия интерфейса: иначе живой link-local утечёт мимо miyori-net
+echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || true
+
+cid="${MIYORI_CID:-0}"
+mac="$(printf '52:54:00:6d:59:%02x' "$cid")"
+# без удева имена интерфейсов нестабильны — опознаём по MAC, как miyori-net в M2 задаче 2
+nic="$(ip -o link | sed -n "s/^[0-9][0-9]*: \([^:@ ]*\).*link\/ether $mac .*/\1/p" | head -1)"
+
+if [ -n "$nic" ]; then
+  ip link set dev "$nic" up
+  ip addr add "10.59.0.$cid/24" dev "$nic"
+  ip route add default via 10.59.0.1 dev "$nic"
+  # резолвер сетевой машины: dnscrypt-proxy ходит наверх по DoH внутри туннеля.
+  # Запасного адреса здесь нет намеренно — 1.1.1.1 открытым текстом виден на выходе,
+  # а молчащий резолвер видно в отчёте miyori-net строкой DNSCRYPT
+  printf 'nameserver 10.59.0.1\n' > /etc/resolv.conf
+
+  # страховка от аварии (сбежавший VPN-клиент, чужой маршрут, ожил IPv6), а не граница доверия:
+  # root внутри спейса снимает эти правила одной командой — настоящая граница живёт на хосте
+  : "${MIYORI_NETROLE:=none}"
+  if [ "$MIYORI_NETROLE" = "none" ]; then
+    nft -f - <<NFTEOF || echo "MIYORI: киллсвитч спейса не загрузился"
+table inet miyori-space {
+	chain output {
+		type filter hook output priority filter; policy drop;
+		oif "lo" accept
+		meta nfproto ipv6 drop
+		oifname "$nic" accept
+	}
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+}
+NFTEOF
+  fi
+else
+  echo "MIYORI: не нашли интерфейс с MAC $mac"
+fi
+
+echo "---MIYORI-NIC-BEGIN---"
+ip -o link || true
+echo "---MIYORI-NIC-END---"
+echo "---MIYORI-ADDR-BEGIN---"
+ip -o addr || true
+echo "---MIYORI-ADDR-END---"
+echo "---MIYORI-ROUTE-BEGIN---"
+ip -4 route || true
+ip -6 route || true
+echo "---MIYORI-ROUTE-END---"
+
+# журналируемая ext4 не трогает Filesystem state при монтировании (оно всегда clean); незакрытый
+# журнал виден по фиче needs_recovery, и снимает её только штатное размонтирование — проверено 2026-08-27.
+# Читаем ДО монтирования: mount проигрывает журнал и флаг снимает, то есть след прошлого останова стирает (§6.1)
+if [ -b /dev/vdb ]; then
+  echo "---MIYORI-DATA-STATE-BEGIN---"
+  data_feats="$(dumpe2fs -h /dev/vdb 2>/dev/null | sed -n 's/^Filesystem features: *//p')"
+  case "$data_feats" in
+    "") ;;
+    *needs_recovery*) echo "needs-recovery" ;;
+    *) echo "recovered" ;;
+  esac
+  echo "---MIYORI-DATA-STATE-END---"
+fi
+
+# постоянный том: overlay корня одноразовый, файловую систему заводит гость при первом монтировании (задача 8)
+data_mounted="fail"
+if [ -b /dev/vdb ]; then
+  dumpe2fs -h /dev/vdb >/dev/null 2>&1 || mkfs.ext4 -q /dev/vdb || echo "MIYORI: mkfs.ext4 /dev/vdb не удался"
+  mkdir -p /data
+  if mount /dev/vdb /data; then
+    data_mounted="ok"
+    # без sync: durability тома обеспечивает только штатный agent::shutdown, не сам факт записи (спека §6.1)
+    echo "${MIYORI_NONCE:-}" >> /data/marker
+  fi
+else
+  echo "MIYORI: нет /dev/vdb — постоянный том не подключен"
+fi
+echo "---MIYORI-DATA-BEGIN---"
+echo "DATA-MOUNTED: $data_mounted"
+cat /data/marker 2>/dev/null || echo "(нет маркера)"
+echo "---MIYORI-DATA-END---"
+
+# системный и пользовательский счётчики живут на разных томах (задача 9), чтобы reset-system и
+# reset-all было по чему различить: reset-system откатывает только первый
+sys_boot_file=/var/lib/miyori-boot-count
+sys_boot=0
+[ -f "$sys_boot_file" ] && sys_boot="$(cat "$sys_boot_file")"
+# счётчики лежат там, куда пишет недоверенный гость: нечисловое значение роняет dash под set -e, а это PID 1
+case "$sys_boot" in ""|*[!0-9]*) sys_boot=0 ;; esac
+sys_boot=$((sys_boot + 1))
+echo "$sys_boot" > "$sys_boot_file"
+
+if [ "$data_mounted" = "ok" ]; then
+  data_boot_file=/data/boot-count
+  data_boot=0
+  [ -f "$data_boot_file" ] && data_boot="$(cat "$data_boot_file")"
+  case "$data_boot" in ""|*[!0-9]*) data_boot=0 ;; esac
+  data_boot=$((data_boot + 1))
+  echo "$data_boot" > "$data_boot_file"
+else
+  data_boot="-"
+fi
+
+echo "---MIYORI-BOOT-BEGIN---"
+echo "BOOT-COUNT-SYSTEM: $sys_boot"
+echo "BOOT-COUNT-DATA: $data_boot"
+echo "---MIYORI-BOOT-END---"
+
+python3 /usr/local/bin/miyori-probe scan "${MIYORI_CID:-0}" \
+  || echo "MIYORI: разведка vsock не отработала"
+
+# сеть проверяем до старта waypipe: проба не должна зависеть от того, откроет ли оператор окно
+: "${MIYORI_NETROLE:=none}"
+np=""
+if [ -n "$nic" ]; then
+  case "$MIYORI_NETROLE" in
+    listener) python3 /usr/local/bin/miyori-netprobe listener "$nic" "$mac" "${MIYORI_PEER_IP:-}" & np=$! ;;
+    prober)   python3 /usr/local/bin/miyori-netprobe prober "$nic" "$mac" "10.59.0.$cid" "${MIYORI_PEER_IP:-}" & np=$! ;;
+    flood)    python3 /usr/local/bin/miyori-netprobe flood "${MIYORI_FLOOD_SECONDS:-0}" & np=$! ;;
+    exitip)   sleep 15; python3 /usr/local/bin/miyori-netprobe exitip "${MIYORI_ECHO_URL:-}" & np=$! ;;
+    hostprobe) python3 /usr/local/bin/miyori-netprobe hostprobe "$nic" "$mac" "10.59.0.$cid" "${MIYORI_HOST_IPS:-}" & np=$! ;;
+    none) ;;
+    *) echo "MIYORI: неизвестная роль $MIYORI_NETROLE" ;;
+  esac
+fi
+
+# демон запускает приложение сам через агента (задача 7); run-guest.sh ничего не передаёт — автостарт как раньше
+: "${MIYORI_APP_AUTOSTART:=1}"
+wp=""
+if [ "$MIYORI_APP_AUTOSTART" != "0" ]; then
+  /usr/local/bin/miyori-launch &
+  wp=$!
+fi
+
+# нужен и демону (health/exec-app), и стенду run-guest.sh — не зависит от автостарта приложения
+/usr/local/bin/miyori-agent &
+
+# первое включение стенда не должно 60 секунд бомбить хост без явного запроса
+: "${MIYORI_FLOOD_SECONDS:=0}"
+if [ "$MIYORI_FLOOD_SECONDS" != "0" ]; then
+  sleep 10
+  python3 /usr/local/bin/miyori-probe flood "$MIYORI_FLOOD_SECONDS" \
+    || echo "MIYORI: флуд не отработал"
+fi
+
+if [ -n "$wp" ]; then
+  wait "$wp" || echo "MIYORI: waypipe завершился с кодом $?"
+fi
+
+# без этого ожидания быстрый провал waypipe (нет брокера в тесте 51) обрывает пробу раньше её тайминга
+[ -z "$np" ] || wait "$np" || echo "MIYORI: netprobe завершился с кодом $?"
+
+# без автостарта гасить VM — работа демона (stop), а не этого скрипта; ждём его молча, а не гасим сами
+if [ -z "$wp" ]; then
+  while true; do sleep 3600; done
+fi
+
+# PID 1 не должен умирать: иначе вместо диагностики получаем kernel panic
+sync
+echo o > /proc/sysrq-trigger || true
+sleep 10

@@ -1,0 +1,15 @@
+[Unit]
+Description=Сетевая фикстура MiyoriOS: br-spaces, tap'ы спейсов, bridge-фильтр
+Before=miyori-net.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@@MIYORI_REPO@@
+# владельца tap'ов net-fixture.sh берёт из SUDO_USER, а под systemd никакого sudo нет
+Environment=SUDO_USER=@@MIYORI_USER@@
+ExecStart=/usr/bin/bash components/net/net-fixture.sh up
+ExecStop=/usr/bin/bash components/net/net-fixture.sh down
+
+[Install]
+WantedBy=multi-user.target

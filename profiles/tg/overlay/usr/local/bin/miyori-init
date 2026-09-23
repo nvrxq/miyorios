@@ -1,0 +1,96 @@
+#!/bin/sh
+# Гостевая сторона: скрипт стартует как PID 1, поэтому базовые ФС монтирует сам
+set -eu
+
+mount -t proc     proc /proc || true
+mount -t sysfs    sys  /sys  || true
+mount -t devtmpfs dev  /dev  || true
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts || true
+# WebKit разносит вкладки по процессам и связывает их разделяемой памятью: без /dev/shm браузер не стартует
+mkdir -p /dev/shm
+mount -t tmpfs shm /dev/shm || true
+mount -t tmpfs    run  /run  || true
+
+# waypipe отказывается стартовать без этой переменной
+XDG_RUNTIME_DIR=/run/miyori
+export XDG_RUNTIME_DIR
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# в госте нет udev: без явного modprobe virtio-устройства остаются без драйвера
+modprobe vmw_vsock_virtio_transport || echo "MIYORI: modprobe vsock не удался"
+modprobe virtio_net || echo "MIYORI: modprobe virtio_net не удался"
+
+# net.ipv6 гасим ДО поднятия интерфейса: иначе живой link-local утечёт мимо miyori-net
+echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || true
+
+cid="${MIYORI_CID:-0}"
+mac="$(printf '52:54:00:6d:59:%02x' "$cid")"
+# без удева имена интерфейсов нестабильны — опознаём по MAC
+nic="$(ip -o link | sed -n "s/^[0-9][0-9]*: \([^:@ ]*\).*link\/ether $mac .*/\1/p" | head -1)"
+
+if [ -n "$nic" ]; then
+  ip link set dev "$nic" up
+  ip addr add "10.59.0.$cid/24" dev "$nic"
+  ip route add default via 10.59.0.1 dev "$nic"
+  # резолвер сетевой машины: dnscrypt-proxy ходит наверх по DoH внутри туннеля.
+  # Запасного адреса здесь нет намеренно — 1.1.1.1 открытым текстом виден на выходе,
+  # а молчащий резолвер видно в отчёте miyori-net строкой DNSCRYPT
+  printf 'nameserver 10.59.0.1\n' > /etc/resolv.conf
+
+  # страховка от аварии (сбежавший VPN-клиент, чужой маршрут, ожил IPv6), а не граница доверия:
+  # root внутри спейса снимает эти правила одной командой — настоящая граница живёт на хосте
+  if [ "${MIYORI_NETROLE:-none}" = "none" ]; then
+    nft -f - <<NFTEOF || echo "MIYORI: киллсвитч спейса не загрузился"
+table inet miyori-space {
+	chain output {
+		type filter hook output priority filter; policy drop;
+		oif "lo" accept
+		meta nfproto ipv6 drop
+		oifname "$nic" accept
+	}
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+}
+NFTEOF
+  fi
+else
+  echo "MIYORI: не нашли интерфейс с MAC $mac"
+fi
+
+# постоянный том: корень одноразовый, поэтому профиль браузера обязан жить здесь
+data_mounted="fail"
+if [ -b /dev/vdb ]; then
+  dumpe2fs -h /dev/vdb >/dev/null 2>&1 || mkfs.ext4 -q /dev/vdb || echo "MIYORI: mkfs.ext4 /dev/vdb не удался"
+  mkdir -p /data
+  if mount /dev/vdb /data; then data_mounted="ok"; fi
+else
+  echo "MIYORI: нет /dev/vdb — постоянный том не подключен"
+fi
+echo "MIYORI: постоянный том: $data_mounted"
+
+: "${MIYORI_APP_AUTOSTART:=1}"
+wp=""
+if [ "$MIYORI_APP_AUTOSTART" != "0" ]; then
+  /usr/local/bin/miyori-launch &
+  wp=$!
+fi
+
+# нужен демону для health и exec-app — не зависит от автостарта приложения
+/usr/local/bin/miyori-agent &
+
+if [ -n "$wp" ]; then
+  wait "$wp" || echo "MIYORI: waypipe завершился с кодом $?"
+fi
+
+# без автостарта гасить VM — работа демона (stop), а не этого скрипта; ждём молча
+if [ -z "$wp" ]; then
+  while true; do sleep 3600; done
+fi
+
+# PID 1 не должен умирать: иначе вместо диагностики получаем kernel panic
+sync
+echo o > /proc/sysrq-trigger || true
+sleep 10

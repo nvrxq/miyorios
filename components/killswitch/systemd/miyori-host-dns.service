@@ -1,0 +1,18 @@
+[Unit]
+Description=miyori — слой DNS хостового киллсвитча: встаёт, когда резолвер сетевой машины ответил
+Documentation=file://@@MIYORI_REPO@@/документации проекта
+# ранний юнит киллсвитча поднимает только IPv6: он стартует до сети, а резолвер живёт в VM
+# и в тот момент молчит — слой DNS по своей же логике не включался и после перезагрузки пропадал
+After=miyori-net.service systemd-resolved.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# VM отвечает не в момент старта юнита, а через десятки секунд после него
+Environment=MIYORI_RESOLVER_WAIT=120
+# режим берём из файла: пересборка таблицы без него сняла бы строгий режим
+ExecStart=/bin/sh -c '/usr/local/sbin/miyori-host-killswitch on $(cat /etc/miyorios/killswitch.mode 2>/dev/null)'
+
+# снимать слой при остановке сетевой машины нечем и незачем: без неё у хоста нет и маршрута наружу
+[Install]
+WantedBy=miyori-net.service

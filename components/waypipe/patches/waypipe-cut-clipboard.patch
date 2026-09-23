@@ -1,0 +1,17 @@
+diff --git a/src/tracking.rs b/src/tracking.rs
+index d9973a9..beb06f4 100644
+--- a/src/tracking.rs
++++ b/src/tracking.rs
+@@ -4195,6 +4195,12 @@ pub fn process_way_msg(
+                 b"zwlr_export_dmabuf_manager_v1",
+                 b"zwp_linux_explicit_synchronization_v1", // outdated, uses fences instead of timelines
+                 b"wp_security_context_manager_v1",        // sends socket listen fd over network
++                // MiyoriOS: clipboard and drag-and-drop are cut at the transport, see ADR-4 and spec §10
++                b"wl_data_device_manager",
++                b"zwp_primary_selection_device_manager_v1",
++                b"gtk_primary_selection_device_manager",
++                b"zwlr_data_control_manager_v1",
++                b"ext_data_control_manager_v1",
+             ];
+ 
+             /* Limit the version of the following protocols to what Waypipe has compiled

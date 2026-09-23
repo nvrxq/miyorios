@@ -1,0 +1,14 @@
+[Unit]
+Description=miyori-net — сетевая VM MiyoriOS
+Requires=miyori-net-fixture.service
+After=miyori-net-fixture.service miyori-net-uplink.service
+
+[Service]
+Type=simple
+WorkingDirectory=@@MIYORI_REPO@@
+EnvironmentFile=/etc/miyorios/miyori-net.env
+ExecStart=/usr/bin/bash components/net/run-miyori-net.sh --uplink ${MIYORI_UPLINK} $MIYORI_HOST_LINK
+# без Restart: тихо перезапущенная сетевая машина — это тихо пересозданный kill-switch
+
+[Install]
+WantedBy=multi-user.target

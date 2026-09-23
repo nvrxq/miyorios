@@ -1,0 +1,12 @@
+[package]
+name = "miyori-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+miyori-config = { path = "../../lib/config" }

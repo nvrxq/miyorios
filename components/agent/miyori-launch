@@ -1,0 +1,5 @@
+#!/bin/sh
+# единственная строка запуска приложения в проекте: её зовут и miyori-init (автостарт), и агент (exec-app)
+: "${MIYORI_PORT:=1700}"
+: "${MIYORI_APP:=/usr/local/bin/miyori-app}"
+exec /usr/local/bin/waypipe --vsock -c none -s "$MIYORI_PORT" server -- "$MIYORI_APP"

@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Гостевая сторона VERIFY: разведка vsock и флуд. Печатает маркеры в консоль."""
+import socket
+import sys
+import time
+
+HOST_CID = 2
+GUI_PORT = 1700
+SCAN_PORTS = sorted({22, 80, 443, 1024, 1690, 1700, 1701, 1702, 2000, 5900, 9999})
+PEER_CIDS = (3, 4, 5)
+
+
+def probe_port(cid, port, timeout=1.0):
+    s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((cid, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def scan(self_cid):
+    print("---MIYORI-VSOCK-BEGIN---", flush=True)
+    for port in SCAN_PORTS:
+        state = "open" if probe_port(HOST_CID, port) else "closed"
+        print(f"host {port} {state}", flush=True)
+    for cid in PEER_CIDS:
+        if cid == self_cid:
+            continue
+        state = "open" if probe_port(cid, GUI_PORT) else "closed"
+        print(f"peer {cid} {state}", flush=True)
+    print("---MIYORI-VSOCK-END---", flush=True)
+
+
+def flood(seconds):
+    print("---MIYORI-FLOOD-BEGIN---", flush=True)
+    s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    payload = b"\xa5" * 65536
+    sent = 0
+    deadline = time.monotonic() + seconds
+    try:
+        s.connect((HOST_CID, GUI_PORT))
+        while time.monotonic() < deadline:
+            sent += s.send(payload)
+    except OSError as exc:
+        print(f"flood-stopped {exc}", flush=True)
+    finally:
+        s.close()
+    print(f"flood-sent {sent}", flush=True)
+    print("---MIYORI-FLOOD-END---", flush=True)
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "scan":
+        scan(int(sys.argv[2]))
+    elif sys.argv[1] == "flood":
+        flood(int(sys.argv[2]))
+    else:
+        raise SystemExit(f"неизвестная подкоманда {sys.argv[1]}")

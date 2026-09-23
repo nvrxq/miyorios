@@ -1,0 +1,31 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # GTK4 — для сборки менеджера, qemu-utils — тесты томов реально зовут qemu-img
+      - run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libgtk-4-dev pkg-config qemu-utils
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked --offline -- -D warnings
+      # тест peer.rs читает CID через vsock-петлю; без модуля он падает не по своей причине
+      - run: sudo modprobe vsock_loopback
+      - run: cargo test --all --locked --offline
+      - run: shellcheck components/*/*.sh install/*.sh tools/*.sh tests/verify/*.sh tests/net/*.sh
+  private-data:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/check-private.sh
+  supply-chain:
+    runs-on: ubuntu-24.04
+    # cargo-deny собирается своим тулчейном: наш зафиксирован и может быть старше его MSRV
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install --locked cargo-deny
+      # зависимости вендорены и реестр недоступен: yanked-проверка тут бессильна,
+      # поэтому advisories не гоняем, а bans/licenses/sources работают офлайн
+      - run: cargo deny --offline check bans licenses sources

@@ -1,0 +1,17 @@
+/target
+/components/waypipe/*
+!/components/waypipe/PINNED
+!/components/waypipe/build.sh
+!/components/waypipe/patches/
+!/components/waypipe/waypipe.pin
+/build
+/blobs
+/output
+__pycache__/
+
+# машина и оператор: см. local/README.md
+/local/
+/plans/
+/docs/
+/CLAUDE.md
+/CLAUDE.local.md

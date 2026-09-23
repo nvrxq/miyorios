@@ -1,0 +1,54 @@
+#!/bin/sh
+# запускается waypipe-сервером, поэтому WAYLAND_DISPLAY уже выставлен им
+export GDK_BACKEND=wayland
+# без UTF-8 локали readline режет многобайтные символы: кириллицу в терминале не набрать
+LANG=C.UTF-8
+LC_ALL=C.UTF-8
+export LANG LC_ALL
+# HOME на постоянном томе: "Сбросить систему" обязан сохранить сессию телеграма, стирает её только "Сбросить всё"
+if [ -d /data ]; then
+  HOME=/data/home
+else
+  HOME=/root
+fi
+export HOME
+mkdir -p "$HOME"
+# /etc/profile.d читает только login-шелл, а foot запускает обычный интерактивный
+[ -e "$HOME/.bashrc" ] || cp /usr/share/miyori/bashrc "$HOME/.bashrc"
+PATH="$HOME/.local/bin:$PATH"
+export PATH
+export TERM=foot
+
+# X-сервера в спейсе нет: без явного выбора Qt молча уходит в xcb и выглядит как «не запустился»
+export QT_QPA_PLATFORM=wayland
+# gpu = "none": mesa в образе нет, и без этого Qt пытается взять аппаратный GL и падает на dlopen
+export LIBGL_ALWAYS_SOFTWARE=1
+
+tg=/opt/Telegram/Telegram
+workdir="$HOME/.local/share/TelegramDesktop"
+mkdir -p "$workdir"
+
+# терминал рядом с телеграмом: причину отказа статической сборки видно только из шелла
+foot &
+shell_pid=$!
+
+if [ ! -x "$tg" ]; then
+  echo "MIYORI: $tg не найден — в спейсе остаётся только терминал"
+  wait "$shell_pid"
+  exit 0
+fi
+
+started="$(cut -d' ' -f1 /proc/uptime)"
+# своя сессионная шина: без неё Qt пытается автозапустить dbus через $DISPLAY, которого здесь нет
+dbus-run-session -- "$tg" -workdir "$workdir"
+code=$?
+ended="$(cut -d' ' -f1 /proc/uptime)"
+echo "MIYORI: телеграм завершился с кодом $code, аптайм $ended"
+
+# мгновенный выход — это отказ запуска, а не закрытое окно: спейс не гасим, оператору нужен шелл
+if awk -v a="$started" -v b="$ended" 'BEGIN { exit !(b - a < 5) }'; then
+  echo "MIYORI: телеграм не прожил и пяти секунд — оставляю терминал открытым"
+  wait "$shell_pid"
+else
+  kill "$shell_pid" 2>/dev/null
+fi

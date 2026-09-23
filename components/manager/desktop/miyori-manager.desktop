@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Miyori
+Comment=Список спейсов MiyoriOS, их детали, сеть и действия
+Exec=/usr/local/bin/miyori-manager
+Icon=miyori
+Terminal=false
+Categories=System;
+StartupWMClass=miyori-manager

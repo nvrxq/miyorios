@@ -1,0 +1,14 @@
+#!/bin/sh
+# один вход в систему: без аргументов открывает менеджер спейсов
+set -eu
+
+self="$(readlink -f "$0")"
+root="$(dirname "$(dirname "$self")")"
+
+for candidate in /usr/local/bin/miyori-manager "$root/target/release/miyori-manager"; do
+  [ -x "$candidate" ] || continue
+  exec "$candidate" "$@"
+done
+
+echo "miyori: менеджер не найден — собери 'cargo build --release -p miyori-manager'" >&2
+exit 1

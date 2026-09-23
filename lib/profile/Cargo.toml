@@ -1,0 +1,20 @@
+[package]
+name = "miyori-profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "miyori-profile"
+path = "src/main.rs"
+
+[lib]
+name = "miyori_profile"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+basic-toml.workspace = true
+miyori-config = { path = "../../lib/config" }

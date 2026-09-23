@@ -1,0 +1,37 @@
+#!/bin/sh
+# запускается waypipe-сервером, поэтому WAYLAND_DISPLAY уже выставлен им
+export GDK_BACKEND=wayland
+# без UTF-8 локали readline режет многобайтные символы: кириллицу в терминале не набрать
+LANG=C.UTF-8
+LC_ALL=C.UTF-8
+export LANG LC_ALL
+# HOME на постоянном томе: "Сбросить систему" обязан сохранить работу, стирает её только "Сбросить всё"
+if [ -d /data ]; then
+  HOME=/data/home
+else
+  HOME=/root
+fi
+export HOME
+mkdir -p "$HOME"
+# /etc/profile.d читает только login-шелл, а foot запускает обычный интерактивный;
+# засеваем один раз и не трогаем, если оператор завёл свой
+[ -e "$HOME/.bashrc" ] || cp /usr/share/miyori/bashrc "$HOME/.bashrc"
+# то, что оператор поставит внутрь руками, должно находиться без правки PATH каждый раз
+PATH="$HOME/.local/bin:/opt/node/bin:$PATH"
+export PATH
+export TERM=foot
+
+# закрытый терминал не должен оставлять спейс "запущенным" без единого окна: выключиться
+# гость не умеет — sysrq под microvm,acpi=off не работает, находка гейта M1
+while :; do
+  started="$(cut -d' ' -f1 /proc/uptime)"
+  foot
+  code=$?
+  ended="$(cut -d' ' -f1 /proc/uptime)"
+  echo "MIYORI: foot завершился с кодом $code, аптайм $ended"
+  # мгновенный выход — это отказ запуска, а не закрытое окно: крутить его в цикле бессмысленно
+  if awk -v a="$started" -v b="$ended" 'BEGIN { exit !(b - a < 2) }'; then
+    echo "MIYORI: терминал не прожил и двух секунд — больше не поднимаю"
+    break
+  fi
+done

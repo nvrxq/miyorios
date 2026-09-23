@@ -1,0 +1,24 @@
+[package]
+name = "miyorid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "miyorid"
+path = "src/main.rs"
+
+[lib]
+name = "miyorid"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+basic-toml.workspace = true
+vsock.workspace = true
+miyori-proto = { path = "../../lib/proto" }
+miyori-config = { path = "../../lib/config" }
+miyori-profile = { path = "../../lib/profile" }

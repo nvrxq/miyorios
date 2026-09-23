@@ -1,0 +1,12 @@
+[package]
+name = "miyori-guid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+vsock.workspace = true
+miyori-config = { path = "../../lib/config" }
+miyori-sandbox = { path = "../../lib/sandbox" }

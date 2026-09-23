@@ -1,0 +1,29 @@
+[advisories]
+yanked = "deny"
+
+[licenses]
+# Полный список того, что реально встречается в third_party/crates. Новая
+# лицензия в дереве — это решение, а не автопродление: пусть падает.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Zlib",
+    "Unlicense",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+# у крейтов воркспейса нет версии в path-зависимости — это не дикая версия из реестра
+allow-wildcard-paths = true
+skip = [
+    # glib-macros тянет syn 2, остальное дерево — syn 3; обе версии из реестра,
+    # выбор не наш и уйдёт с обновлением gtk-rs
+    { crate = "syn@2.0.119" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
